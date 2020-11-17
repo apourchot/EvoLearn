@@ -1,89 +1,34 @@
 from copy import deepcopy
 import argparse
+import ray
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pandas as pd
 
-import gym
 import gym.spaces
-import numpy as np
 from tqdm import tqdm
 
-from ES import sepCEM, Control
+from ES import sepCEM
 from models import RLNN
 from random_process import GaussianNoise, OrnsteinUhlenbeckProcess
 from memory import Memory
 from util import *
 
-USE_CUDA = torch.cuda.is_available()
+from typing import Union
+
+
+# USE_CUDA = torch.cuda.is_available()
+USE_CUDA = False
 if USE_CUDA:
     FloatTensor = torch.cuda.FloatTensor
 else:
     FloatTensor = torch.FloatTensor
 
 
-def evaluate(actor, env, memory=None, n_episodes=1, random=False, noise=None, render=False):
-    """
-    Computes the score of an actor on a given number of runs,
-    fills the memory if needed
-    """
-
-    if not random:
-        def policy(state):
-            state = FloatTensor(state.reshape(-1))
-            action = actor(state).cpu().data.numpy().flatten()
-
-            if noise is not None:
-                action += noise.sample()
-
-            return np.clip(action, -max_action, max_action)
-
-    else:
-        def policy(state):
-            return env.action_space.sample()
-
-    scores = []
-    steps = 0
-
-    for _ in range(n_episodes):
-
-        score = 0
-        obs = deepcopy(env.reset())
-        done = False
-
-        while not done:
-
-            # get next action and act
-            action = policy(obs)
-            n_obs, reward, done, _ = env.step(action)
-            done_bool = 0 if steps + \
-                1 == env._max_episode_steps else float(done)
-            score += reward
-            steps += 1
-
-            # adding in memory
-            if memory is not None:
-                memory.add((obs, n_obs, action, reward, done_bool))
-            obs = n_obs
-
-            # render if needed
-            if render:
-                env.render()
-
-            # reset when done
-            if done:
-                env.reset()
-
-        scores.append(score)
-
-    return np.mean(scores), steps
-
-
 class Actor(RLNN):
 
-    def __init__(self, state_dim, action_dim, max_action, args):
+    def __init__(self, state_dim: int, action_dim: int, max_action: int, args):
         super(Actor, self).__init__(state_dim, action_dim, max_action)
 
         self.l1 = nn.Linear(state_dim, 400)
@@ -103,7 +48,6 @@ class Actor(RLNN):
         self.max_action = max_action
 
     def forward(self, x):
-
         if not self.layer_norm:
             x = torch.tanh(self.l1(x))
             x = torch.tanh(self.l2(x))
@@ -116,10 +60,9 @@ class Actor(RLNN):
 
         return x
 
-    def update(self, memory, batch_size, critic, actor_t):
-
+    def update(self, batch, critic, actor_t):
         # Sample replay buffer
-        states, _, _, _, _ = memory.sample(batch_size)
+        states, _, _, _, _ = batch
 
         # Compute actor loss
         if args.use_td3:
@@ -172,10 +115,10 @@ class Critic(RLNN):
 
         return x
 
-    def update(self, memory, batch_size, actor_t, critic_t):
+    def update(self, batch, batch_size, actor_t, critic_t):
 
         # Sample replay buffer
-        states, n_states, actions, rewards, dones = memory.sample(batch_size)
+        states, n_states, actions, rewards, dones = batch
 
         # Q target = reward + discount * Q(next_state, pi(next_state))
         with torch.no_grad():
@@ -255,10 +198,10 @@ class CriticTD3(RLNN):
 
         return x1, x2
 
-    def update(self, memory, batch_size, actor_t, critic_t):
+    def update(self, batch, batch_size: int, actor_t: Actor, critic_t: Critic):
 
         # Sample replay buffer
-        states, n_states, actions, rewards, dones = memory.sample(batch_size)
+        states, n_states, actions, rewards, dones = batch
 
         # Select action according to policy and add clipped noise
         noise = np.clip(np.random.normal(0, self.policy_noise, size=(
@@ -288,6 +231,87 @@ class CriticTD3(RLNN):
         for param, target_param in zip(self.parameters(), critic_t.parameters()):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data)
+
+
+@ray.remote
+class CEMRLWorker:
+    """
+    This call is used for parallel actors evaluation and updates with ray.
+    """
+    def __init__(self, env, actor: Actor, critic: Union[Critic, CriticTD3]):
+        self._env = env
+        self._actor = actor
+        self._critic = critic
+
+    def evaluate(self, actor_params, n_episodes=1, random=False, noise=None):
+        """
+        Computes the score of an actor on a given number of runs,
+        Returns the mean scores, the number of steps as well as
+        the collected transitions.
+        """
+
+        self._actor.set_params(actor_params)
+
+        if not random:
+            def policy(state):
+                state = FloatTensor(state.reshape(-1))
+                action = self._actor(state).cpu().data.numpy().flatten()
+
+                if noise is not None:
+                    action += noise.sample()
+
+                return np.clip(action, -max_action, max_action)
+
+        else:
+            def policy(state):
+                return env.action_space.sample()
+
+        scores = []
+        transitions = []
+        steps = 0
+
+        for _ in range(n_episodes):
+
+            score = 0
+            obs = deepcopy(self._env.reset())
+            done = False
+
+            while not done:
+
+                # get next action and act
+                action = policy(obs)
+                n_obs, reward, done, _ = self._env.step(action)
+                done_bool = 0 if steps + \
+                    1 == self._env._max_episode_steps else float(done)
+                score += reward
+                steps += 1
+
+                # adding in memory
+                transitions.append((obs, n_obs, action, reward, done_bool))
+                obs = n_obs
+
+                # reset when done
+                if done:
+                    self._env.reset()
+
+            scores.append(score)
+
+        return np.mean(scores), steps, transitions
+
+    def update(self, batches, actor_params, critic_params, lr):
+        """
+        Updates the actor params weights on the batches on transitions.
+        Returns the updated params.
+        """
+        self._actor.set_params(actor_params)
+        actor_t = deepcopy(self._actor)
+        self._critic.set_params(critic_params)
+        self._actor.optimizer = torch.optim.Adam(actor.parameters(), lr=lr)
+
+        for batch in tqdm(batches):
+            self._actor.update(batch, critic, actor_t)
+
+        return self._actor.get_params()
 
 
 if __name__ == "__main__":
@@ -357,6 +381,9 @@ if __name__ == "__main__":
         for key, value in vars(args).items():
             file.write("{} = {}\n".format(key, value))
 
+    # start ray
+    ray.init()
+
     # environment
     env = gym.make(args.env)
     state_dim = env.observation_space.shape[0]
@@ -382,6 +409,8 @@ if __name__ == "__main__":
     actor_t = Actor(state_dim, action_dim, max_action, args)
     actor_t.load_state_dict(actor.state_dict())
 
+    workers = [CEMRLWorker.remote(env, actor, critic) for _ in range(args.pop_size)]
+
     # action noise
     if not args.ou_noise:
         a_noise = GaussianNoise(action_dim, sigma=args.gauss_sigma)
@@ -396,16 +425,31 @@ if __name__ == "__main__":
         actor_t.cuda()
 
     # CEM
-    es = sepCEM(actor.get_size(), mu_init=actor.get_params(), sigma_init=args.sigma_init, damp=args.damp, damp_limit=args.damp_limit,
-                pop_size=args.pop_size, antithetic=not args.pop_size % 2, parents=args.pop_size // 2, elitism=args.elitism)
-    # es = Control(actor.get_size(), pop_size=args.pop_size, mu_init=actor.get_params())
+    es = sepCEM(
+        actor.get_size(),
+        mu_init=actor.get_params(),
+        sigma_init=args.sigma_init,
+        damp=args.damp,
+        damp_limit=args.damp_limit,
+        pop_size=args.pop_size,
+        antithetic=not args.pop_size % 2,
+        parents=args.pop_size // 2,
+        elitism=args.elitism
+    )
 
     # training
     step_cpt = 0
     total_steps = 0
     actor_steps = 0
-    df = pd.DataFrame(columns=["total_steps", "average_score",
-                               "average_score_rl", "average_score_ea", "best_score"])
+
+    df = pd.DataFrame(columns=[
+        "total_steps",
+        "average_score",
+        "average_score_rl",
+        "average_score_ea",
+        "best_score"
+    ])
+
     while total_steps < args.max_steps:
 
         fitness = []
@@ -415,41 +459,74 @@ if __name__ == "__main__":
         # udpate the rl actors and the critic
         if total_steps > args.start_steps:
 
+            # critic update
+            for _ in tqdm(range(actor_steps)):
+                batch = memory.sample(batch_size=args.batch_size)
+                critic.update(batch, args.batch_size, actor, critic_t)
+
+            # get new critic parameters
+            critic_params = critic.get_params()
+
+            # samples batches to train the actors
+            batches_list = [
+                [memory.sample(args.batch_size) for _ in range(actor_steps)]
+                for _ in range(args.n_grad)
+            ]
+
+            # train actors in parallel
+            updated_es_params = ray.get(
+                [
+                    workers[i].update.remote(
+                        batches_list[i],
+                        es_params[i],
+                        critic_params,
+                        args.actor_lr
+                    )
+                    for i in range(args.n_grad)
+                ]
+            )
+
+            # update es parameters with new actors parameters
             for i in range(args.n_grad):
+                es_params[i] = updated_es_params[i]
 
-                # set params
-                actor.set_params(es_params[i])
-                actor_t.set_params(es_params[i])
-                actor.optimizer = torch.optim.Adam(
-                    actor.parameters(), lr=args.actor_lr)
-
-                # critic update
-                for _ in tqdm(range(actor_steps // args.n_grad)):
-                    critic.update(memory, args.batch_size, actor, critic_t)
-
-                # actor update
-                for _ in tqdm(range(actor_steps)):
-                    actor.update(memory, args.batch_size,
-                                 critic, actor_t)
-
-                # get the params back in the population
-                es_params[i] = actor.get_params()
         actor_steps = 0
 
-        # evaluate noisy actor(s)
-        for i in range(args.n_noisy):
-            actor.set_params(es_params[i])
-            f, steps = evaluate(actor, env, memory=memory, n_episodes=args.n_episodes,
-                                render=args.render, noise=a_noise)
+        # evaluate noisy actor(s) in parallel
+        outs = ray.get(
+            [
+                workers[i].evaluate.remote(
+                    es_params[i],
+                    n_episodes=args.n_episodes,
+                    noise=a_noise
+                )
+                for i in range(args.n_noisy)
+            ]
+        )
+
+        # update replay buffer with collected transitions
+        for f, steps, transitions in outs:
+
+            for transition in transitions:
+                memory.add(transition)
+
             actor_steps += steps
             prCyan('Noisy actor {} fitness:{}'.format(i, f))
 
-        # evaluate all actors
-        for params in es_params:
+        # evaluate all actors in parallel
+        outs = ray.get(
+            [
+                workers[i].evaluate.remote(params, n_episodes=args.n_episodes)
+                for i, params in enumerate(es_params)
+            ]
+        )
 
-            actor.set_params(params)
-            f, steps = evaluate(actor, env, memory=memory, n_episodes=args.n_episodes,
-                                render=args.render)
+        # update replay buffer with collected transitions
+        for f, steps, transitions in outs:
+
+            for transition in transitions:
+                memory.add(transition)
+
             actor_steps += steps
             fitness.append(f)
 
@@ -468,32 +545,48 @@ if __name__ == "__main__":
 
             # evaluate mean actor over several runs. Memory is not filled
             # and steps are not counted
-            actor.set_params(es.mu)
-            f_mu, _ = evaluate(actor, env, memory=None, n_episodes=args.n_eval,
-                               render=args.render)
+            f_mu, _, _ = ray.get([workers[0].evaluate.remote(
+                es.mu,
+                n_episodes=args.n_eval
+            )])[0]
+
             prRed('Actor Mu Average Fitness:{}'.format(f_mu))
 
             df.to_pickle(args.output + "/log.pkl")
-            res = {"total_steps": total_steps,
-                   "average_score": np.mean(fitness),
-                   "average_score_half": np.mean(np.partition(fitness, args.pop_size // 2 - 1)[args.pop_size // 2:]),
-                   "average_score_rl": np.mean(fitness[:args.n_grad]),
-                   "average_score_ea": np.mean(fitness[args.n_grad:]),
-                   "best_score": np.max(fitness),
-                   "mu_score": f_mu}
+
+            average_score_half = np.partition(fitness, args.pop_size // 2 - 1)
+            average_score_half = np.mean(average_score_half[args.pop_size // 2:])
+            res = {
+                "total_steps": total_steps,
+                "average_score": np.mean(fitness),
+                "average_score_half": average_score_half,
+                "average_score_rl": np.mean(fitness[:args.n_grad]),
+                "average_score_ea": np.mean(fitness[args.n_grad:]),
+                "best_score": np.max(fitness),
+                "mu_score": f_mu
+            }
 
             if args.save_all_models:
-                os.makedirs(args.output + "/{}_steps".format(total_steps),
-                            exist_ok=True)
+                os.makedirs(
+                    args.output + "/{}_steps".format(total_steps),
+                    exist_ok=True
+                )
+
                 critic.save_model(
-                    args.output + "/{}_steps".format(total_steps), "critic")
+                    args.output + "/{}_steps".format(total_steps),
+                    "critic"
+                )
+
                 actor.set_params(es.mu)
                 actor.save_model(
-                    args.output + "/{}_steps".format(total_steps), "actor_mu")
+                    args.output + "/{}_steps".format(total_steps),
+                    "actor_mu"
+                )
             else:
                 critic.save_model(args.output, "critic")
                 actor.set_params(es.mu)
                 actor.save_model(args.output, "actor")
+
             df = df.append(res, ignore_index=True)
             step_cpt = 0
             print(res)
