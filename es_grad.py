@@ -233,8 +233,11 @@ class CriticTD3(RLNN):
                 self.tau * param.data + (1 - self.tau) * target_param.data)
 
 
-@ray.remote(num_cpus=1)
+@ray.remote
 class CEMRLWorker:
+    """
+    This call is used for parallel actors evaluation and updates with ray.
+    """
     def __init__(self, env, actor: Actor, critic: Union[Critic, CriticTD3]):
         self._env = env
         self._actor = actor
@@ -243,7 +246,8 @@ class CEMRLWorker:
     def evaluate(self, actor_params, n_episodes=1, random=False, noise=None):
         """
         Computes the score of an actor on a given number of runs,
-        fills the memory if needed
+        Returns the mean scores, the number of steps as well as
+        the collected transitions.
         """
 
         self._actor.set_params(actor_params)
@@ -295,6 +299,10 @@ class CEMRLWorker:
         return np.mean(scores), steps, transitions
 
     def update(self, batches, actor_params, critic_params, lr):
+        """
+        Updates the actor params weights on the batches on transitions.
+        Returns the updated params.
+        """
         self._actor.set_params(actor_params)
         actor_t = deepcopy(self._actor)
         self._critic.set_params(critic_params)
@@ -374,7 +382,7 @@ if __name__ == "__main__":
             file.write("{} = {}\n".format(key, value))
 
     # start ray
-    ray.init(num_cpus=args.pop_size + 1)
+    ray.init()
 
     # environment
     env = gym.make(args.env)
@@ -456,11 +464,16 @@ if __name__ == "__main__":
                 batch = memory.sample(batch_size=args.batch_size)
                 critic.update(batch, args.batch_size, actor, critic_t)
 
+            # get new critic parameters
             critic_params = critic.get_params()
+
+            # samples batches to train the actors
             batches_list = [
                 [memory.sample(args.batch_size) for _ in range(actor_steps)]
                 for _ in range(args.n_grad)
             ]
+
+            # train actors in parallel
             updated_es_params = ray.get(
                 [
                     workers[i].update.remote(
@@ -472,12 +485,14 @@ if __name__ == "__main__":
                     for i in range(args.n_grad)
                 ]
             )
+
+            # update es parameters with new actors parameters
             for i in range(args.n_grad):
                 es_params[i] = updated_es_params[i]
 
         actor_steps = 0
 
-        # evaluate noisy actor(s)
+        # evaluate noisy actor(s) in parallel
         outs = ray.get(
             [
                 workers[i].evaluate.remote(
@@ -489,6 +504,7 @@ if __name__ == "__main__":
             ]
         )
 
+        # update replay buffer with collected transitions
         for f, steps, transitions in outs:
 
             for transition in transitions:
@@ -497,7 +513,7 @@ if __name__ == "__main__":
             actor_steps += steps
             prCyan('Noisy actor {} fitness:{}'.format(i, f))
 
-        # evaluate all actors
+        # evaluate all actors in parallel
         outs = ray.get(
             [
                 workers[i].evaluate.remote(params, n_episodes=args.n_episodes)
@@ -505,6 +521,7 @@ if __name__ == "__main__":
             ]
         )
 
+        # update replay buffer with collected transitions
         for f, steps, transitions in outs:
 
             for transition in transitions:
